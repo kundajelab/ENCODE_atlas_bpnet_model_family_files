@@ -389,3 +389,108 @@ def find_models_by_organ(organ, family=None, assay_title=None, limit=25, timeout
         if len(out) >= limit:
             break
     return out
+
+
+# The slim facets ENCODE exposes on a biosample -- widened past organ so "immune B cell" (cell/system),
+# "fetal brain" (developmental), etc. resolve, not just organs.
+_SLIM_TYPES = ["organ_slims", "cell_slims", "system_slims", "developmental_slims"]
+
+# Deterministic, auditable free-text -> slim-vocabulary map (the L1 query resolver; no ML). Maps loose
+# words that are NOT themselves ENCODE slim values onto ones that are. Extend as real queries miss.
+_SLIM_SYNONYMS = {
+    "hepatic": "liver", "hcc": "liver", "hepatocellular": "liver", "hepatocyte": "liver",
+    "bile organ": "liver", "b cell": "B cell", "b-cell": "B cell", "lymphoblast": "B cell",
+    "lymphoblastoid": "B cell", "immune": "immune system", "immune cell": "immune system",
+    "cardiac": "heart", "cardiomyocyte": "heart", "myocardial": "heart",
+    "renal": "kidney", "neural": "brain", "neuronal": "brain", "neuron": "brain",
+    "cortical": "brain", "cerebral": "brain", "pulmonary": "lung", "mammary": "breast",
+    "gut": "intestine", "bowel": "intestine", "colonic": "large intestine",
+}
+# loose life-stage words -> ENCODE life_stage vocabulary
+_LIFESTAGE_SYNONYMS = {"fetal": "embryonic", "foetal": "embryonic", "prenatal": "embryonic"}
+
+
+def _norm_terms(term):
+    """Candidate slim values for a free-text term: the term itself + synonym-map expansions (exact,
+    then substring). De-duplicated, order-preserving."""
+    if not term:
+        return []
+    t = term.strip().lower()
+    cands = [term.strip()]
+    if t in _SLIM_SYNONYMS:
+        cands.append(_SLIM_SYNONYMS[t])
+    for k, v in _SLIM_SYNONYMS.items():
+        if k in t:
+            cands.append(v)
+    seen, out = set(), []
+    for c in cands:
+        if c.lower() not in seen:
+            seen.add(c.lower()); out.append(c)
+    return out
+
+
+def find_models_by_biosample(term, family=None, assay_title=None, organism=None,
+                             life_stage=None, slim_types=None, limit=25, timeout=30):
+    """Discover models from a free-text tissue/cell/system/developmental description, WITHOUT the
+    accession -- the L1 discovery path. Widens find_models_by_organ past organ_slims to cell/system/
+    developmental slims, adds optional organism + life_stage facets, and resolves loose words via a
+    deterministic synonym map. The ONTOLOGY decides membership (an ENCODE slim-facet set-intersection);
+    similarity is never involved. Every returned model carries `authorized_by` = the exact facet+value
+    that admitted it, so the choice is auditable. E.g. 'immune B cell' -> GM12878 via cell_slims;
+    'mouse liver' -> mouse liver models via organism; 'hepatic' -> HepG2 via synonym(liver)+organ_slims.
+
+    Returns [{accession, family, assay, tissue, target, qc, authorized_by:{facet,value},
+    encode_biosample}]. Empty list = honest miss (no slim matched); the caller should abstain, never
+    fall back to a fuzzy guess."""
+    import json as _json
+    import urllib.parse
+    import urllib.request
+    slim_types = slim_types or _SLIM_TYPES
+    ls = life_stage
+    if ls and ls.strip().lower() in _LIFESTAGE_SYNONYMS:
+        ls = _LIFESTAGE_SYNONYMS[ls.strip().lower()]
+    # The ENCODE BPNet-family Atlas index is human-only, and the tables carry no per-model organism
+    # column -- so a non-human request is an honest EMPTY, never a silent human fallback. (When
+    # non-human models are added, replace this with a real per-model organism filter.)
+    if organism and organism.strip().lower() not in ("homo sapiens", "human", "h. sapiens", "hsapiens"):
+        return []
+    idx = _load()
+    out, seen = [], set()
+    for cand in _norm_terms(term):
+        before = len(out)
+        for st in slim_types:
+            # Only the slim facet (+ assay_title) go in the ENCODE query -- both are known-good facets.
+            # organism / life_stage are filtered CLIENT-SIDE from biosample_summary (their deep-path
+            # facets 404 the whole query, which would silently zero the result).
+            q = [("type", "Experiment"), ("format", "json"), ("limit", "300"),
+                 ("biosample_ontology." + st, cand)]
+            if assay_title:
+                q.append(("assay_title", assay_title))
+            url = "https://www.encodeproject.org/search/?" + urllib.parse.urlencode(q)
+            try:
+                req = urllib.request.Request(url, headers={"Accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    d = _json.load(r)
+            except Exception:
+                continue   # invalid slim value for this facet -> ENCODE 404s; just try the next
+            for h in d.get("@graph", []) or []:
+                acc = h.get("accession")
+                rec = idx.get(acc)
+                if not rec or acc in seen:
+                    continue
+                if family and rec["_family"] != family.lower():
+                    continue
+                bs = h.get("biosample_summary") or ""
+                if ls and bs and ls.lower() not in bs.lower():
+                    continue   # best-effort life-stage filter (only when the summary carries it)
+                m = rec["_meta"]
+                seen.add(acc)
+                out.append({"accession": acc, "family": rec["_family"], "assay": m.get("assay"),
+                            "tissue": m.get("tissue"), "target": m.get("target"), "qc": m.get("qc"),
+                            "authorized_by": {"facet": "biosample_ontology." + st, "value": cand},
+                            "encode_biosample": h.get("biosample_summary")})
+                if len(out) >= limit:
+                    return out
+            if len(out) > before:
+                break   # this candidate matched a slim -> don't spend calls on the other slim types
+    return out
