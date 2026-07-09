@@ -23,6 +23,14 @@ ea.model_files("ENCSR032RGS")                    # family + metadata + all objec
 ea.download("ENCSR032RGS", "model", "./models/") # the trained model tar; also: motifs, contrib_counts,
                                                  #   contrib_profile, signal_predicted, motif_hits, ...
 
+# discovery -- you know the tissue, not the accession
+ea.facets()                                      # what exists: counts by family / assay / tissue / target
+ea.find_models("liver", family="chrombpnet")     # free-text over tissue/target/assay (ranked, QC first)
+ea.find_models_by_organ("liver", family="chrombpnet", assay_title="ATAC-seq")
+                                                 # ontology-aware: 'liver' -> HepG2 + hepatocyte + liver
+                                                 #   tissue (via ENCODE organ_slims), which a string
+                                                 #   match on the tissue column would miss
+
 # search OUR model index (the four family tables)
 ea.search(family="chrombpnet", biosample="K562") # -> [{accession, family, assay, target, tissue, qc}]
 

@@ -301,3 +301,91 @@ def portal_search(assay_title=None, biosample=None, target=None, limit=25, timeo
     return [{"accession": h.get("accession"), "assay": h.get("assay_title"),
              "biosample": h.get("biosample_summary"),
              "target": (h.get("target") or {}).get("label")} for h in d.get("@graph", []) or []]
+
+
+# ------------------------------------------------- discovery (no ENCID needed) ---
+# An agent that only knows "I want an accessibility model for liver" -- not the ENCODE accession --
+# finds one via these. facets() shows what exists; find_models() free-text-ranks our index;
+# find_models_by_organ() is ontology-aware (ENCODE's organ_slims maps 'liver' -> HepG2 / hepatocyte /
+# liver tissue, which a plain tissue-string match would miss).
+
+def facets():
+    """What the index actually contains, so an agent can browse instead of guessing an accession:
+    counts by family / assay / tissue / target. tissue+target sorted by frequency."""
+    from collections import Counter
+    idx = _load()
+    fam, assay, tissue, target = Counter(), Counter(), Counter(), Counter()
+    for rec in idx.values():
+        m = rec["_meta"]
+        fam[rec["_family"]] += 1
+        for c, k in ((assay, "assay"), (tissue, "tissue"), (target, "target")):
+            if m.get(k):
+                c[m[k]] += 1
+    return {"family": dict(fam), "assay": dict(assay.most_common()),
+            "tissue": dict(tissue.most_common()), "target": dict(target.most_common(300))}
+
+
+def find_models(query, family=None, assay=None, limit=25):
+    """Free-text discovery over the index -- match `query` against tissue / target / assay / accession,
+    ranked (exact > word-boundary > substring), QC-passed first. Returns ranked candidates. For a loose
+    ORGAN word that is not literally in a cell-line name (e.g. 'liver' vs 'HepG2'), use
+    find_models_by_organ, which asks ENCODE's biosample ontology."""
+    idx = _load()
+    q = (query or "").strip().lower()
+    scored = []
+    for acc, rec in idx.items():
+        m, fam = rec["_meta"], rec["_family"]
+        if family and fam != family.lower():
+            continue
+        if assay and assay.lower() not in (m.get("assay", "") or "").lower():
+            continue
+        best = 0
+        for val in ((m.get("tissue", "") or "").lower(), (m.get("target", "") or "").lower(),
+                    (m.get("assay", "") or "").lower(), acc.lower()):
+            if not val or not q:
+                continue
+            if val == q:
+                best = max(best, 100)
+            elif val.startswith(q) or ((" " + q) in (" " + val)):
+                best = max(best, 60)
+            elif q in val:
+                best = max(best, 30)
+        if best:
+            scored.append((best, 0 if (m.get("qc") == "passed") else 1,
+                           {"accession": acc, "family": fam, "assay": m.get("assay"),
+                            "target": m.get("target"), "tissue": m.get("tissue"), "qc": m.get("qc")}))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [r for _, _, r in scored[:limit]]
+
+
+def find_models_by_organ(organ, family=None, assay_title=None, limit=25, timeout=30):
+    """Ontology-aware discovery: ask ENCODE for experiments in an organ (biosample `organ_slims`),
+    then keep the ones we have MODELS for. Catches 'liver' -> HepG2 / hepatocyte / liver tissue that a
+    tissue-string match on our table would miss. Returns our matching models (accession, family, ...)."""
+    import json as _json
+    import urllib.parse
+    import urllib.request
+    q = [("type", "Experiment"), ("format", "json"), ("limit", "300"),
+         ("biosample_ontology.organ_slims", organ)]
+    if assay_title:
+        q.append(("assay_title", assay_title))
+    url = "https://www.encodeproject.org/search/?" + urllib.parse.urlencode(q)
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = _json.load(r)
+    idx = _load()
+    out = []
+    for h in d.get("@graph", []) or []:
+        acc = h.get("accession")
+        rec = idx.get(acc)
+        if not rec:
+            continue
+        if family and rec["_family"] != family.lower():
+            continue
+        m = rec["_meta"]
+        out.append({"accession": acc, "family": rec["_family"], "assay": m.get("assay"),
+                    "tissue": m.get("tissue"), "target": m.get("target"), "qc": m.get("qc"),
+                    "encode_biosample": h.get("biosample_summary")})
+        if len(out) >= limit:
+            break
+    return out
